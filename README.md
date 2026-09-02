@@ -9,13 +9,13 @@ Firmware untuk memonitor sepeda statis (mis. Bodymax): menghitung **cadence, spe
  Rotary enc A/B | GPIO25/26 (interrupt, quadrature x4)          |
  (dekat pedal)  |    -> cadence (rpm) -> speed virtual          |
                 |                                               |
- VL53L0X (I2C)  | GPIO21 SDA / GPIO22 SCL                       |
+ Motor Servo    | GPIO21 SDA / GPIO22 SCL                      |
  (pulley depan) |    -> jarak magnet -> level beban -> torsi    |
                 |                                               |----> TFT LCD (SPI)
- Heart rate     | GPIO27 (pulse) atau GPIO34 (analog)          |
+ Heart rate     | GPIO27 (pulse) atau GPIO34 (analog)           |
  (bawaan bike)  |    -> BPM                                     |----> WiFi AP/STA
-                |                                               |        http://<ip>/
-                |  power = torsi x kecepatan sudut engkol       |        WebSocket /ws
+HR ganti ke     |                                               |        http://<ip>/
+  max30100      |  power = torsi x kecepatan sudut engkol       |        WebSocket /ws
                 +-----------------------------------------------+
 ```
 
@@ -23,7 +23,7 @@ Firmware untuk memonitor sepeda statis (mis. Bodymax): menghitung **cadence, spe
 
 | File | Isi |
 |------|-----|
-| `StaticBikeMonitor.ino` | Program utama: baca sensor, kalkulasi, TFT, web server. |
+| `StaticBikeMonitor.ino` | Program utama: baca sensor, kalkulasi, TFT, web server komunikasi bolak balik. |
 | `config.h` | **Semua** pin, konstanta kalibrasi, kredensial WiFi. Ubah di sini. |
 | `index_html.h` | Dashboard live (PROGMEM) yang disajikan ESP32. |
 | `HEART_RATE_REVERSE_ENGINEERING.md` | Panduan membaca sinyal HR bawaan Bodymax. |
