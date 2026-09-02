@@ -1,138 +1,142 @@
-# Static Bike Monitor (ESP32)
+# Rencana Pengembangan — Sepeda Statis FPOK
+### Fase: Adaptasi Beban Otomatis (Stepper) + Simulasi Aplikasi + Heart Rate
 
-Firmware untuk memonitor sepeda statis (mis. Bodymax): menghitung **cadence, speed, torsi, level beban, power, energi, kalori,** dan **heart rate**, menampilkannya di **TFT LCD**, lalu menyiarkannya secara **wireless** lewat WiFi internal ESP32 ke perangkat lain (HP/laptop) melalui **web dashboard + WebSocket** real-time.
+Dokumen pegangan tim. Mencerminkan keputusan terbaru (aktuator **stepper**, MAX30100, protokol dua-arah).
 
-## Ringkasan arsitektur
+---
 
-```
-                +-------------------- ESP32 --------------------+
- Rotary enc A/B | GPIO25/26 (interrupt, quadrature x4)          |
- (dekat pedal)  |    -> cadence (rpm) -> speed virtual          |
-                |                                               |
- Motor Servo    | GPIO21 SDA / GPIO22 SCL                      |
- (pulley depan) |    -> jarak magnet -> level beban -> torsi    |
-                |                                               |----> TFT LCD (SPI)
- Heart rate     | GPIO27 (pulse) atau GPIO34 (analog)           |
- (bawaan bike)  |    -> BPM                                     |----> WiFi AP/STA
-HR ganti ke     |                                               |        http://<ip>/
-  max30100      |  power = torsi x kecepatan sudut engkol       |        WebSocket /ws
-                +-----------------------------------------------+
-```
+## 1. Kondisi Proyek Saat Ini
 
-## File dalam proyek
+- Platform: **ESP32 tunggal (1 MCU)**, WiFi sebagai **Access Point (AP) kontinu**.
+- Kontrol lewat **web dashboard** + **aplikasi Android sendiri** (WiFi/JSON, offline).
+- Sudah berjalan: **cadence** (rotary encoder 1:1), **torsi/power/speed**, **TFT**, **logging sesi** (LittleFS CSV), **heart rate** (MAX30100), dan **kendali beban via stepper**.
+- Komunikasi **dua arah** aktif: unit kirim telemetri + terima perintah dari aplikasi.
 
-| File | Isi |
-|------|-----|
-| `StaticBikeMonitor.ino` | Program utama: baca sensor, kalkulasi, TFT, web server komunikasi bolak balik. |
-| `config.h` | **Semua** pin, konstanta kalibrasi, kredensial WiFi. Ubah di sini. |
-| `index_html.h` | Dashboard live (PROGMEM) yang disajikan ESP32. |
-| `HEART_RATE_REVERSE_ENGINEERING.md` | Panduan membaca sinyal HR bawaan Bodymax. |
+---
 
-## Library yang dibutuhkan
+## 2. Keputusan yang Dikunci
 
-Instal via Arduino Library Manager (atur di `platformio.ini` bila pakai PlatformIO):
+| No | Item | Nilai |
+|---|---|---|
+| 1 | Sensor beban VL53L0X | **Dihapus** |
+| 2 | Aktuator beban | **Motor stepper NEMA23 5718HB3401** (~3,4 A) penarik seling |
+| 3 | Driver stepper | **TB6600** atau **DM542** (wajib; A4988/DRV8825 tidak cukup) |
+| 4 | Jumlah level beban | **8 level** |
+| 5 | Heart rate | **MAX30100** (I2C) |
+| 6 | MCU | **1 MCU (ESP32)** |
+| 7 | Koneksi aplikasi | **WiFi AP**, aplikasi **buatan sendiri** (WiFi/JSON, offline) |
+| 8 | Flywheel / puli depan | **6 kg**, diameter **25 cm** (r = 0,125 m); puli encoder sama diameter → rasio **1:1** |
 
-- **ESP32Encoder** — pembacaan encoder quadrature berbasis hardware PCNT.
-- **Adafruit_VL53L0X** — sensor jarak ToF.
-- **TFT_eSPI** (Bodmer) — driver TFT. **Wajib** mengatur `User_Setup.h`.
-- **ESPAsyncWebServer** + **AsyncTCP** — web server & WebSocket async.
+---
 
-> Board di Boards Manager: paket **esp32 by Espressif Systems**. Pilih "ESP32 Dev Module".
+## 3. Peta Pin (FINAL) — tidak ada konflik
 
-## Wiring
+Tetap (tidak diubah): Encoder A/B = GPIO 25/26 · TFT SPI (User_Setup.h) = CS15, DC2, RST4, MOSI23, SCK18, MISO19.
 
-### Encoder (quadrature A/B)
-| Encoder | ESP32 |
-|---------|-------|
-| VCC | 3V3 (atau 5V bila encoder butuh 5V + level shifter untuk sinyal) |
-| GND | GND |
-| A (out A) | GPIO25 |
-| B (out B) | GPIO26 |
+| Komponen | Pin ESP32 | Catatan |
+|---|---|---|
+| VL53L0X | — | Dihapus |
+| **Stepper STEP / PUL+** | **GPIO 13** | ke driver |
+| **Stepper DIR+** | **GPIO 27** | ke driver |
+| **Stepper ENA+** | **GPIO 14** | aktif LOW |
+| Driver PUL− / DIR− / ENA− | **GND ESP32** | common ground |
+| Motor (A+/A−/B+/B−) | terminal driver | catu driver 12–24 V terpisah |
+| **Limit switch homing** | **GPIO 32** + GND | opsional (`USE_HOMING`) |
+| **MAX30100 SDA / SCL** | **GPIO 21 / 22** | bus I2C bekas VLX |
+| MAX30100 VIN / GND | 3V3 / GND | logika 3,3 V |
 
-Pasang di poros dekat pedal yang berputar bersama gear. Jika encoder di poros yang berputar **lebih cepat** dari engkol (via pulley), isi `GEAR_RATIO_ENC_PER_CRANK` di `config.h`.
+**Wajib:** semua GND disatukan (ESP32, driver, catu daya, MAX30100). GPIO 12 sengaja tidak dipakai (strapping).
 
-> ⚠️ Banyak encoder industri (mis. LPD3806) beroperasi 5–24V dan output open-collector. Gunakan resistor pull-up ke 3V3 dan pastikan level sinyal aman untuk GPIO ESP32 (maks 3.3V). Bila output 5V, gunakan level shifter/pembagi tegangan.
+---
 
-### VL53L0X (I2C)
-| VL53L0X | ESP32 |
-|---------|-------|
-| VIN | 3V3 |
-| GND | GND |
-| SDA | GPIO21 |
-| SCL | GPIO22 |
-| XSHUT | (opsional) set pin di `config.h` |
+## 4. Komunikasi Dua Arah (WiFi AP)
 
-Arahkan sensor ke besi/target yang jaraknya berubah terhadap magnet beban saat level diputar. Rentang efektif VL53L0X ~30–1200 mm (paling stabil < 500 mm).
+Alamat unit: **192.168.4.1**. Satu koneksi, dua aliran.
 
-### TFT LCD (SPI) — contoh ILI9341
-| TFT | ESP32 |
-|-----|-------|
-| VCC | 3V3 |
-| GND | GND |
-| CS | GPIO15 |
-| DC/RS | GPIO2 |
-| RST | GPIO4 |
-| SDI/MOSI | GPIO23 |
-| SCK | GPIO18 |
-| LED | 3V3 |
-| SDO/MISO | GPIO19 (opsional) |
+**Unit → Aplikasi (telemetri, ~2×/detik)** via `/ws` atau `/data`:
 
-Pin ini **didefinisikan di `User_Setup.h` milik TFT_eSPI**, bukan di `config.h`. Contoh isi:
+| Field | Satuan |
+|---|---|
+| cadence | rpm |
+| power | watt |
+| torque | Nm (est) |
+| speed | km/j (virtual) |
+| heartRate | bpm |
+| level | 1–8 (aktual) |
+| actuatorPos | langkah stepper |
+| mode | sim/manual/cognitive |
+| grade | % |
+| state, elapsed, stops | — |
 
-```cpp
-#define ILI9341_DRIVER
-#define TFT_MOSI 23
-#define TFT_SCLK 18
-#define TFT_CS   15
-#define TFT_DC    2
-#define TFT_RST   4
-#define SPI_FREQUENCY 40000000
-```
+**Aplikasi → Unit (kendali)** — field `level` diseragamkan di kedua jalur:
 
-### Heart rate
-Lihat `HEART_RATE_REVERSE_ENGINEERING.md`. Setelah tahu tipe sinyal, set `HR_MODE` di `config.h`:
-- **Pulse digital** → `HR_MODE_PULSE`, sambungkan ke **GPIO27**.
-- **Analog** → `HR_MODE_ANALOG`, sambungkan ke **GPIO34** (input ADC1).
+| Field | Fungsi |
+|---|---|
+| mode | `sim` / `manual` / `cognitive` |
+| grade | kemiringan % (mode sim) |
+| level | set level 1–8 (mode manual) |
 
-## Kalibrasi (langkah wajib)
-
-1. **Encoder PPR** — isi `ENCODER_PPR` sesuai datasheet. Verifikasi: kayuh 10 putaran penuh, cek `encoder.getCount()` ≈ `PPR*4*10`.
-2. **VL53L0X level** — buka Serial Monitor, baca `distMm`:
-   - Putar beban ke **paling ringan**, catat jarak → `DIST_AT_MIN_LOAD_MM`.
-   - Putar ke **paling berat**, catat jarak → `DIST_AT_MAX_LOAD_MM`.
-   - Set `LEVEL_COUNT` sesuai jumlah level fisik sepeda.
-3. **Speed** — sesuaikan `WHEEL_CIRCUMFERENCE_M` dan `DRIVE_RATIO_WHEEL_PER_CRANK` agar terasa realistis (cadence 60 rpm ≈ 25–30 km/j pada rasio umum).
-4. **Torsi** — `TORQUE_BASE_NM`, `TORQUE_PER_LEVEL_NM`, `TORQUE_CADENCE_GAIN`. Untuk akurat, bandingkan dengan power meter komersial dan sesuaikan konstanta.
-
-> Torsi di sini adalah **estimasi model** (rem magnetik: torsi ≈ fungsi jarak magnet + kecepatan), bukan pengukuran langsung. Untuk torsi sebenarnya butuh strain-gauge/load cell pada engkol.
-
-## Cara upload
-
-1. Buka `StaticBikeMonitor.ino` di Arduino IDE.
-2. Instal semua library di atas + atur `User_Setup.h` TFT_eSPI.
-3. Pilih board "ESP32 Dev Module", pilih port, klik Upload.
-4. Buka Serial Monitor (115200) untuk melihat IP.
-
-## Menghubungkan perangkat lain
-
-- **Mode AP** (default): di HP/laptop, sambung ke WiFi **`BikeMonitor`** (pass `bike12345`), buka **`http://192.168.4.1`**.
-- **Mode STA**: set `WIFI_MODE = WIFI_MODE_STA` + isi SSID/pass router, lalu buka IP yang tampil di Serial Monitor.
-- Endpoint tambahan: **`GET /data`** mengembalikan JSON (untuk integrasi/aplikasi sendiri).
-
-Contoh JSON:
+Contoh (WebSocket ke `ws://192.168.4.1/ws`):
 ```json
-{"cadence":62.0,"speed":26.4,"torque":7.35,"level":4,"power":47.7,
- "hr":128,"energyKJ":12.34,"cal":12.7,"distMm":78,"elapsed":183}
+{"mode":"sim","grade":8}
+{"mode":"manual","level":6}
 ```
+Alternatif HTTP: `GET /set?mode=sim&grade=8` atau `/set?mode=manual&level=6`.
+Kontrol sesi: `GET /cmd?action=start|pause|stop|reset|levelUp|levelDown`.
 
-## Rumus yang dipakai
+---
 
-- Cadence: `rpm = (Δcount / (PPR·4)) / Δt · 60 / GEAR_RATIO`
-- Speed: `v = cadence · DRIVE_RATIO · keliling_roda`, dikonversi ke km/j
-- Torsi: `τ = (TORQUE_BASE + TORQUE_PER_LEVEL·(level−1)) · (1 + gain·(rpm−rpm_ref))`
-- Power: `P = τ · ω`, dengan `ω = 2π · rpm/60` (rad/s) → **Watt**
-- Energi: `E = ∫P dt` (kJ); Kalori metabolik ≈ `(E/4.184)/0.24`
+## 5. Mekanisme Leveling (Stepper)
 
-## Catatan keselamatan & hukum
+- Level 1–8 → **posisi langkah** stepper. `LEVEL_TRAVEL_STEPS` = total langkah level 1→8 (placeholder 4000, dikalibrasi).
+- Gerakan halus otomatis lewat **akselerasi AccelStepper** (`STEPPER_MAX_SPEED`, `STEPPER_ACCEL`).
+- **Homing** (opsional, disarankan): saat menyala, stepper mencari limit switch (GPIO 32) → titik nol = level 1. Bila `USE_HOMING 0`, aktuator harus diset ke level 1 sebelum power-on (stepper tak tahu posisi awal).
+- Aturan **grade → level** (mode sim, dapat diubah): `level = 1 + round(grade / 2)`, dibatasi 1–8; grade negatif → level 1.
 
-Reverse engineering sinyal HR dilakukan pada perangkat milik sendiri untuk interoperabilitas. Jangan pernah menyambungkan elektronik ke bagian yang terhubung listrik jala-jala; sepeda statis magnetik umumnya pasif/baterai sehingga aman diprobe pada tegangan rendah. Selalu ukur tegangan sebelum menyambung ke ESP32 (maks 3.3V per GPIO).
+---
+
+## 6. Pemilih Mode
+
+- **`sim`** — beban ikut `grade` dari aplikasi (fokus sekarang).
+- **`manual`** — operator set `level`.
+- **`cognitive`** — (menyusul) otomatis dari variabilitas kadens sesuai paten.
+
+Servo/stepper hanya digerakkan satu sumber sesuai mode aktif.
+
+---
+
+## 7. Heart Rate (MAX30100)
+
+- Dibaca di **task core-1** ESP32 agar tak terganggu WiFi; hasil `heartRate` masuk telemetri.
+- Klip di jari/telinga yang diam; kelas kebugaran, **bukan diagnosis**.
+
+---
+
+## 8. Library yang Perlu Di-install
+
+`AccelStepper` · `MAX30100lib` · `ESPAsyncWebServer` (ESP32Async) + `Async TCP` (ESP32Async) · `ESP32Encoder` · `TFT_eSPI` · `ArduinoJson`.
+
+---
+
+## 9. Kalibrasi yang Masih Perlu
+
+- **LEVEL_TRAVEL_STEPS**: hitung berapa langkah stepper untuk menarik seling dari beban paling ringan (level 1) ke paling berat (level 8).
+- **Arah stepper** (`HOME_DIR`) dan setelan **driver** (arus ≈ 3–3,4 A, microstep).
+- Konfirmasi bentuk puli untuk inersia (`FLYWHEEL_SHAPE`: 0 = cakram, 1 = tepi).
+
+---
+
+## 10. Catatan Sisi Aplikasi Android (WiFi AP)
+
+- Selama tersambung ke AP unit, HP **tanpa internet** — aplikasi berjalan offline.
+- **Wajib**: ikat koneksi aplikasi ke jaringan WiFi unit (`ConnectivityManager.requestNetwork` + `bindProcessToNetwork`) agar permintaan tidak lari ke jaringan seluler.
+
+---
+
+## 11. Roadmap
+
+- **Fase A (sekarang):** stepper leveling + mode sim/manual + MAX30100 + protokol dua-arah.
+- **Fase B:** kalibrasi Level→langkah presisi; homing dengan limit switch; penguatan mekanik.
+- **Fase C:** mode `cognitive` (paten) — sampling encoder dipercepat ≥50 Hz untuk variabilitas kadens.
+
+> Catatan hukum (berkas paten): jangan publikasikan data uji / dokumen invensi sebelum tanggal penerimaan permohonan paten.
