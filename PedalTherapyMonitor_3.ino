@@ -2,7 +2,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <ESP32Encoder.h>
-#include <ESP32Servo.h>
+#include <AccelStepper.h>
 #include <MAX30100_PulseOximeter.h>
 #include <TFT_eSPI.h>
 #include <ESPAsyncWebServer.h>
@@ -34,26 +34,37 @@ static const int   AP_MAX_CONN = 4;
 #define I2C_SCL_PIN         22
 
 // =============================================================================
-//  ####  KALIBRASI FISIK BELUM DIUBAH  ####
+//  ####  KALIBRASI FISIK — SILAKAN UBAH SENDIRI  ####
 // =============================================================================
 // ---- Umum ----
 #define CRANK_LENGTH_M       0.238f
 
-// ---- Flywheel (torsi & power) ----
-#define FLYWHEEL_MASS_KG     5.0f    // TODO: massa flywheel (kg)
-#define FLYWHEEL_RADIUS_M    0.25f   // TODO: jari-jari flywheel (m)
-#define FLYWHEEL_SHAPE       1       // 0 = pejal (0.5 m r^2) ; 1 = pelek (m r^2)
+// ---- Flywheel / puli depan (torsi & power) ----
+#define FLYWHEEL_MASS_KG     6.0f    // puli depan 6 kg
+#define FLYWHEEL_RADIUS_M    0.125f  // diameter 25 cm -> jari-jari 0,125 m
+#define FLYWHEEL_SHAPE       0       // 0 = pejal/cakram (0.5 m r^2) ; 1 = pelek (m r^2)
+                                     //   (puli 6 kg diasumsikan cakram; ubah ke 1 bila berat di tepi)
 
 // ---- Speed virtual ----
 #define WHEEL_CIRC_M         2.105f
 #define DRIVE_RATIO          3.0f
 
-// ---- SERVO LEVELING (beban) ----
-#define SERVO_PIN            13
+// ---- STEPPER LEVELING (beban) — driver STEP/DIR (TB6600 / DM542) ----
+#define STEP_PIN             13      // ke PUL/STEP driver
+#define DIR_PIN              27      // ke DIR driver
+#define EN_PIN               14      // ke ENA driver (aktif LOW pada umumnya)
+#define HOME_PIN             32      // limit switch homing (INPUT_PULLUP, ke GND saat ditekan)
+#define USE_HOMING           0       // 0 = tanpa switch (posisi awal dianggap level 1)
+                                     // 1 = homing pakai limit switch di HOME_PIN
+
 #define LEVEL_COUNT          8       // jumlah level beban (1..8)
-#define SERVO_MIN_DEG        10.0f   // sudut level 1 (beban paling ringan)
-#define SERVO_MAX_DEG        170.0f  // sudut level 8 (beban paling berat)
-#define SERVO_RATE_DEG_S     40.0f   // batas laju gerak servo (derajat/detik)
+// Total langkah (microstep) dari level 1 (paling ringan) ke level 8 (paling berat).
+// PLACEHOLDER — kalibrasi: hitung berapa langkah untuk menarik seling dari ringan ke berat.
+#define LEVEL_TRAVEL_STEPS   4000
+#define STEPPER_MAX_SPEED    800.0f  // langkah/detik (microstep)
+#define STEPPER_ACCEL        400.0f  // langkah/detik^2
+#define HOME_SPEED           300.0f  // langkah/detik saat homing
+#define HOME_DIR             -1      // arah menuju switch home (-1 atau +1)
 #define GRADE_PER_LEVEL      2.0f    // mode sim: tiap +2% grade naik 1 level
 
 // ---- Kurva BEBAN (torsi estimasi dari level) ----
@@ -67,7 +78,6 @@ static const int   AP_MAX_CONN = 4;
 
 // ---- Timing ----
 #define SAMPLE_MS           250
-#define SERVO_UPDATE_MS      20
 #define TFT_REFRESH_MS      200
 #define WS_PUSH_MS          500
 
@@ -95,8 +105,8 @@ struct Metrics {
   float torqueNm   = 0;
   float powerW     = 0;
   float speedKmh   = 0;
-  int   level      = 1;    // level beban aktual (dari posisi servo)
-  float servoAngle = SERVO_MIN_DEG;
+  int   level      = 1;    // level beban aktual (dari posisi stepper)
+  long  actuatorPos = 0;   // posisi stepper (microstep)
   float heartRate  = 0;    // dari MAX30100 (core-1)
   float rotations  = 0;
 };
@@ -132,7 +142,7 @@ inline float flywheelInertia() {
 // 4. GLOBAL OBJECTS
 // =============================================================================
 ESP32Encoder    encoder;
-Servo           servoLoad;
+AccelStepper    stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 PulseOximeter   pox;
 TFT_eSPI        tft = TFT_eSPI();
 AsyncWebServer  server(80);
@@ -152,13 +162,12 @@ uint16_t targetDurationMin = DEFAULT_DURATION_MIN;
 
 int64_t lastEncCount = 0;
 float   gOmega = 0, gAlpha = 0, lastOmega = 0;
-uint32_t lastSampleMs = 0, lastServoMs = 0, lastTftMs = 0, lastWsMs = 0;
+uint32_t lastSampleMs = 0, lastTftMs = 0, lastWsMs = 0;
 
 // ---- Kendali beban / mode ----
 String  g_mode        = "manual";   // "sim" | "manual" | "cognitive"
 int     targetLevel   = 1;          // level yang dituju
 float   g_grade       = 0;          // dari aplikasi (mode sim)
-float   currentAngle  = SERVO_MIN_DEG;
 
 // ---- Heart rate (dibagi dengan task core-1) ----
 volatile float g_heartRate = 0;
@@ -216,7 +225,7 @@ h1{font-size:17px;font-weight:600;text-align:center;margin-bottom:2px}
   <div class="card"><div class="label">Speed</div><div class="value" id="speed">0</div><div class="unit">km/j &middot; virtual</div></div>
   <div class="card"><div class="label">Torsi</div><div class="value" id="torque">0</div><div class="unit">Nm &middot; est</div></div>
   <div class="card"><div class="label">Level Beban</div><div class="value" id="level">1</div><div class="unit">1-8</div></div>
-  <div class="card"><div class="label">Servo</div><div class="value" id="servo">0</div><div class="unit">derajat</div></div>
+  <div class="card"><div class="label">Aktuator</div><div class="value" id="servo">0</div><div class="unit">langkah</div></div>
   <div class="card"><div class="label">Waktu Sesi</div><div class="value" id="elapsed">00:00</div><div class="unit">mm:ss</div></div>
 </div>
 <div class="info">
@@ -248,7 +257,7 @@ function updateUI(d){
   document.getElementById('speed').textContent=d.speed.toFixed(1);
   document.getElementById('torque').textContent=d.torque.toFixed(1);
   document.getElementById('level').textContent=d.level;
-  document.getElementById('servo').textContent=d.servoAngle.toFixed(0);
+  document.getElementById('servo').textContent=d.actuatorPos;
   document.getElementById('target').textContent=d.targetLevel;
   document.getElementById('grade').textContent=d.grade.toFixed(0)+' %';
   document.getElementById('dur').textContent=d.targetMin+' menit';
@@ -293,10 +302,11 @@ connect();poll();
 // =============================================================================
 void updateCadence(float dtSec);
 void updateLoadAndTorque();
-void updateServo(float dtSec);
+void updateActuator();
+void homeStepper();
 int  gradeToLevel(float grade);
-float angleForLevel(int level);
-int  levelForAngle(float angle);
+long positionForLevel(int level);
+int  levelForPosition(long pos);
 void selfCheck();
 void enterState(SystemState s);
 void handleStateLogic();
@@ -338,13 +348,17 @@ void setup() {
   if (hr_ok) { pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA); Serial.println("[MAX30100] OK"); }
   else       Serial.println("[MAX30100] GAGAL — cek wiring/pull-up I2C");
 
-  // Servo (alokasikan timer LEDC agar tidak bentrok)
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  servoLoad.setPeriodHertz(50);
-  servoLoad.attach(SERVO_PIN, 500, 2400);
-  currentAngle = SERVO_MIN_DEG;
-  servoLoad.write((int)currentAngle);
+  // Stepper (driver STEP/DIR)
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW);          // aktifkan driver (aktif LOW)
+  stepper.setMaxSpeed(STEPPER_MAX_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+#if USE_HOMING
+  homeStepper();                      // cari titik nol via limit switch
+#else
+  stepper.setCurrentPosition(0);      // anggap posisi awal = level 1 (paling ringan)
+#endif
+  stepper.moveTo(positionForLevel(1));
 
   // LittleFS
   fs_ok = LittleFS.begin(true);
@@ -387,12 +401,9 @@ void loop() {
   uint32_t now = millis();
   met.heartRate = g_heartRate;   // ambil hasil dari task HR
 
-  // Servo update (halus, 20 ms)
-  if (now - lastServoMs >= SERVO_UPDATE_MS) {
-    float dt = (now - lastServoMs) / 1000.0f;
-    lastServoMs = now;
-    updateServo(dt);
-  }
+  // Aktuator stepper: set target menurut mode, lalu jalankan (tiap loop)
+  updateActuator();
+  stepper.run();
 
   // Sampling sensor (250 ms)
   if (sysState != ST_BOOT && sysState != ST_FAULT) {
@@ -521,14 +532,14 @@ void updateLoadAndTorque() {
 }
 
 // =============================================================================
-// 13. SERVO LEVELING
+// 13. STEPPER LEVELING
 // =============================================================================
-float angleForLevel(int level) {
+long positionForLevel(int level) {
   level = constrain(level, 1, LEVEL_COUNT);
-  return SERVO_MIN_DEG + (float)(level - 1) / (LEVEL_COUNT - 1) * (SERVO_MAX_DEG - SERVO_MIN_DEG);
+  return (long)((float)(level - 1) / (LEVEL_COUNT - 1) * LEVEL_TRAVEL_STEPS);
 }
-int levelForAngle(float angle) {
-  float frac = (angle - SERVO_MIN_DEG) / (SERVO_MAX_DEG - SERVO_MIN_DEG);
+int levelForPosition(long pos) {
+  float frac = (float)pos / (float)LEVEL_TRAVEL_STEPS;
   int lv = (int)roundf(frac * (LEVEL_COUNT - 1)) + 1;
   return constrain(lv, 1, LEVEL_COUNT);
 }
@@ -537,21 +548,28 @@ int gradeToLevel(float grade) {
   int lv = 1 + (int)roundf(grade / GRADE_PER_LEVEL);
   return constrain(lv, 1, LEVEL_COUNT);
 }
-void updateServo(float dtSec) {
+// Homing: gerak konstan menuju switch, set titik nol (level 1)
+void homeStepper() {
+  pinMode(HOME_PIN, INPUT_PULLUP);
+  stepper.setMaxSpeed(HOME_SPEED);
+  stepper.setSpeed(HOME_DIR * HOME_SPEED);
+  uint32_t t0 = millis();
+  while (digitalRead(HOME_PIN) == HIGH && millis() - t0 < 15000) {
+    stepper.runSpeed();               // langkah kecepatan tetap
+  }
+  stepper.setCurrentPosition(0);      // titik nol = level 1
+  stepper.setMaxSpeed(STEPPER_MAX_SPEED);
+}
+void updateActuator() {
   // Tentukan target level menurut mode
   if (g_mode == "sim") targetLevel = gradeToLevel(g_grade);
-  // mode "manual": targetLevel diatur tombol/app
-  // mode "cognitive": (menyusul) — sementara pertahankan targetLevel
+  // "manual": targetLevel dari tombol/app ; "cognitive": (menyusul) pertahankan
 
-  float targetAngle = angleForLevel(targetLevel);
-  float step = SERVO_RATE_DEG_S * dtSec;          // batasi laju
-  if (currentAngle < targetAngle) currentAngle = min(currentAngle + step, targetAngle);
-  else if (currentAngle > targetAngle) currentAngle = max(currentAngle - step, targetAngle);
-  currentAngle = constrain(currentAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
+  long targetPos = positionForLevel(targetLevel);
+  if (stepper.targetPosition() != targetPos) stepper.moveTo(targetPos);
 
-  servoLoad.write((int)roundf(currentAngle));
-  met.servoAngle = currentAngle;
-  met.level = levelForAngle(currentAngle);
+  met.actuatorPos = stepper.currentPosition();
+  met.level = levelForPosition(met.actuatorPos);
 }
 
 // =============================================================================
@@ -624,7 +642,7 @@ String buildJson() {
   doc["heartRate"]  = met.heartRate;
   doc["level"]      = met.level;
   doc["targetLevel"]= targetLevel;
-  doc["servoAngle"] = met.servoAngle;
+  doc["actuatorPos"] = met.actuatorPos;
   doc["grade"]      = g_grade;
   doc["rotations"]  = met.rotations;
   doc["elapsed"]    = sessionElapsed;
@@ -674,7 +692,7 @@ void tftDrawState() {
       tftBanner("SIAP", "Kontrol via web/app", 0x2104);
       tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.setTextSize(1);
       tft.setCursor(6,46); tft.print("CADENCE"); tft.setCursor(6,86); tft.print("LEVEL");
-      tft.setCursor(6,126); tft.print("SERVO"); tft.setCursor(170,46); tft.print("HR");
+      tft.setCursor(6,126); tft.print("AKTUATOR"); tft.setCursor(170,46); tft.print("HR");
       tft.setCursor(170,86); tft.print("MODE");
       tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.setCursor(170,100); tft.print(g_mode);
@@ -685,7 +703,7 @@ void tftDrawState() {
       tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.setTextSize(1);
       tft.setCursor(6,46); tft.print("CADENCE"); tft.setCursor(6,86); tft.print("POWER (W)");
       tft.setCursor(6,126); tft.print("LEVEL"); tft.setCursor(6,166); tft.print("HR (bpm)");
-      tft.setCursor(170,46); tft.print("SERVO"); tft.setCursor(170,86); tft.print("WAKTU");
+      tft.setCursor(170,46); tft.print("AKTUATOR"); tft.setCursor(170,86); tft.print("WAKTU");
       break;
     }
     case ST_PAUSED: tftBanner("JEDA", "RESUME / STOP", 0x4208); break;
@@ -714,7 +732,7 @@ void tftDrawMetrics() {
     field(6,98,String(met.powerW,0));
     field(6,138,String(met.level));
     field(6,178,(met.heartRate>0)?String(met.heartRate,0):"--");
-    field(170,58,String(met.servoAngle,0));
+    field(170,58,String(met.actuatorPos));
     char t[10]; snprintf(t,sizeof(t),"%02u:%02u",sessionElapsed/60,sessionElapsed%60);
     field(170,98,String(t));
     float prog=constrain((float)sessionElapsed/((float)targetDurationMin*60.0f),0.0f,1.0f);
@@ -723,7 +741,7 @@ void tftDrawMetrics() {
   } else if (sysState == ST_READY) {
     field(6,58,String(met.cadenceRpm,0));
     field(6,98,String(met.level));
-    field(6,138,String(met.servoAngle,0));
+    field(6,138,String(met.actuatorPos));
     field(170,58,(met.heartRate>0)?String(met.heartRate,0):"--");
   }
 }
@@ -767,8 +785,11 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       if (deserializeJson(in, data, len) == DeserializationError::Ok) {
         String mode = in["mode"] | g_mode;
         bool hasGrade = in.containsKey("grade");
-        bool hasLevel = in.containsKey("targetLevel");
-        applyControl(mode, hasGrade, in["grade"] | 0.0f, hasLevel, in["targetLevel"] | targetLevel);
+        // Field level diseragamkan: terima "level" (utama) atau "targetLevel" (alias)
+        bool hasLevel = in.containsKey("level") || in.containsKey("targetLevel");
+        int  lvl = in.containsKey("level") ? (in["level"] | targetLevel)
+                                           : (in["targetLevel"] | targetLevel);
+        applyControl(mode, hasGrade, in["grade"] | 0.0f, hasLevel, lvl);
       }
     }
   }
