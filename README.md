@@ -8,17 +8,17 @@ Dokumen pegangan tim. Mencerminkan keputusan terbaru (aktuator **stepper**, MAX3
 ## 1. Kondisi Proyek Saat Ini
 
 - Platform: **ESP32 tunggal (1 MCU)**, WiFi sebagai **Access Point (AP) kontinu**.
-- Kontrol lewat **web dashboard** + **aplikasi Android sendiri** (WiFi/JSON, offline).
+- Kontrol lewat **aplikasi Android Vendor** (WiFi/JSON, offline buat sekarang).
 - Sudah berjalan: **cadence** (rotary encoder 1:1), **torsi/power/speed**, **TFT**, **logging sesi** (LittleFS CSV), **heart rate** (MAX30100), dan **kendali beban via stepper**.
 - Komunikasi **dua arah** aktif: unit kirim telemetri + terima perintah dari aplikasi.
 
 ---
 
-## 2. Keputusan yang Dikunci
+## 2. Komponen FIX 
 
 | No | Item | Nilai |
 |---|---|---|
-| 1 | Sensor beban VL53L0X | **Dihapus** |
+| 1 | Sensor beban VL53L0X | **Ganti Motor Steper** |
 | 2 | Aktuator beban | **Motor stepper NEMA23 5718HB3401** (~3,4 A) penarik seling |
 | 3 | Driver stepper | **TB6600** atau **DM542** (wajib; A4988/DRV8825 tidak cukup) |
 | 4 | Jumlah level beban | **8 level** |
@@ -35,7 +35,7 @@ Tetap (tidak diubah): Encoder A/B = GPIO 25/26 · TFT SPI (User_Setup.h) = CS15,
 
 | Komponen | Pin ESP32 | Catatan |
 |---|---|---|
-| VL53L0X | — | Dihapus |
+| VL53L0X | — | Pin Tuker ke servo |
 | **Stepper STEP / PUL+** | **GPIO 13** | ke driver |
 | **Stepper DIR+** | **GPIO 27** | ke driver |
 | **Stepper ENA+** | **GPIO 14** | aktif LOW |
@@ -112,13 +112,7 @@ Servo/stepper hanya digerakkan satu sumber sesuai mode aktif.
 
 ---
 
-## 8. Library yang Perlu Di-install
-
-`AccelStepper` · `MAX30100lib` · `ESPAsyncWebServer` (ESP32Async) + `Async TCP` (ESP32Async) · `ESP32Encoder` · `TFT_eSPI` · `ArduinoJson`.
-
----
-
-## 9. Kalibrasi yang Masih Perlu
+## 8. Kalibrasi yang Masih Perlu
 
 - **LEVEL_TRAVEL_STEPS**: hitung berapa langkah stepper untuk menarik seling dari beban paling ringan (level 1) ke paling berat (level 8).
 - **Arah stepper** (`HOME_DIR`) dan setelan **driver** (arus ≈ 3–3,4 A, microstep).
@@ -126,14 +120,7 @@ Servo/stepper hanya digerakkan satu sumber sesuai mode aktif.
 
 ---
 
-## 10. Catatan Sisi Aplikasi Android (WiFi AP)
-
-- Selama tersambung ke AP unit, HP **tanpa internet** — aplikasi berjalan offline.
-- **Wajib**: ikat koneksi aplikasi ke jaringan WiFi unit (`ConnectivityManager.requestNetwork` + `bindProcessToNetwork`) agar permintaan tidak lari ke jaringan seluler.
-
----
-
-## 11. Roadmap
+## 9. Roadmap
 
 - **Fase A (sekarang):** stepper leveling + mode sim/manual + MAX30100 + protokol dua-arah.
 - **Fase B:** kalibrasi Level→langkah presisi; homing dengan limit switch; penguatan mekanik.
