@@ -5,11 +5,11 @@ Dokumen pegangan tim. Mencerminkan keputusan terbaru (aktuator **stepper**, MAX3
 
 ---
 
-## 1. Kondisi Proyek Saat Ini
+## 1. Kondisi Sekarang
 
 - Platform: **ESP32 tunggal (1 MCU)**, WiFi sebagai **Access Point (AP) kontinu**.
 - Kontrol lewat **aplikasi Android Vendor** (WiFi/JSON, offline buat sekarang).
-- Sudah berjalan: **cadence** (rotary encoder 1:1), **torsi/power/speed**, **TFT**, **logging sesi** (LittleFS CSV), **heart rate** (MAX30100), dan **kendali beban via stepper**.
+- Sudah berjalan: **cadence** (rotary encoder 1:1), **torsi/power/speed**, **TFT** (Masih PR buat UI), **logging sesi** (LittleFS CSV), **heart rate** (MAX30100), dan **kendali beban via stepper**.
 - Komunikasi **dua arah** aktif: unit kirim telemetri + terima perintah dari aplikasi.
 
 ---
