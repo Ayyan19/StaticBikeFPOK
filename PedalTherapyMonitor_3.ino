@@ -1,10 +1,16 @@
+#define USE_TFT   0
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <ESP32Encoder.h>
 #include <AccelStepper.h>
-#include <MAX30100_PulseOximeter.h>
-#include <TFT_eSPI.h>
+#include <MAX30105.h>      // SparkFun MAX3010x — mendukung MAX30102
+#include "heartRate.h"     // algoritma deteksi denyut (checkForBeat)
+#include "spo2_algorithm.h"// algoritma Maxim: HR + SpO2 dari buffer IR/RED
+#if USE_TFT
+  #include <TFT_eSPI.h>
+#endif
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -29,9 +35,13 @@ static const int   AP_MAX_CONN = 4;
 #define ENCODER_DIRECTION   1
 #define GEAR_RATIO          1.0f
 
-// ---- I2C (MAX30100 numpang bus ini; VLX sudah dihapus) ----
+// ---- I2C (MAX30102 numpang bus ini; VLX sudah dihapus) ----
 #define I2C_SDA_PIN         21
 #define I2C_SCL_PIN         22
+// Ambang IR untuk deteksi jari. Turunkan bila jari terpasang tapi tetap "--".
+// Cek Serial Monitor: [IR] <angka>. Set HR_FINGER_IR sedikit di ATAS angka tanpa jari.
+#define HR_FINGER_IR        7000
+#define HR_DEBUG            1        // 1 = cetak nilai IR mentah ke Serial (~1x/detik)
 
 // =============================================================================
 //  ####  KALIBRASI FISIK — SILAKAN UBAH SENDIRI  ####
@@ -61,8 +71,8 @@ static const int   AP_MAX_CONN = 4;
 // Total langkah (microstep) dari level 1 (paling ringan) ke level 8 (paling berat).
 // PLACEHOLDER — kalibrasi: hitung berapa langkah untuk menarik seling dari ringan ke berat.
 #define LEVEL_TRAVEL_STEPS   4000
-#define STEPPER_MAX_SPEED    800.0f  // langkah/detik (microstep)
-#define STEPPER_ACCEL        400.0f  // langkah/detik^2
+#define STEPPER_MAX_SPEED    150.0f  // langkah/detik (pelan = torsi besar; naikkan bila naik-turun sudah lancar)
+#define STEPPER_ACCEL         80.0f  // langkah/detik^2 (lembut = tak mudah stall saat menarik beban)
 #define HOME_SPEED           300.0f  // langkah/detik saat homing
 #define HOME_DIR             -1      // arah menuju switch home (-1 atau +1)
 #define GRADE_PER_LEVEL      2.0f    // mode sim: tiap +2% grade naik 1 level
@@ -73,7 +83,7 @@ static const int   AP_MAX_CONN = 4;
 #define CADENCE_REF_RPM     60.0f
 #define TORQUE_CADENCE_GAIN  0.010f
 
-// ---- TFT ----
+// ---- TFT ----  (USE_TFT didefinisikan di atas, sebelum #include)
 #define TFT_ROTATION          1
 
 // ---- Timing ----
@@ -107,7 +117,8 @@ struct Metrics {
   float speedKmh   = 0;
   int   level      = 1;    // level beban aktual (dari posisi stepper)
   long  actuatorPos = 0;   // posisi stepper (microstep)
-  float heartRate  = 0;    // dari MAX30100 (core-1)
+  float heartRate  = 0;    // dari MAX30102 (core-1)
+  float spo2       = 0;    // saturasi oksigen % (core-1)
   float rotations  = 0;
 };
 struct SessionAccum {
@@ -143,8 +154,10 @@ inline float flywheelInertia() {
 // =============================================================================
 ESP32Encoder    encoder;
 AccelStepper    stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
-PulseOximeter   pox;
+MAX30105        particleSensor;
+#if USE_TFT
 TFT_eSPI        tft = TFT_eSPI();
+#endif
 AsyncWebServer  server(80);
 AsyncWebSocket  ws("/ws");
 
@@ -165,12 +178,17 @@ float   gOmega = 0, gAlpha = 0, lastOmega = 0;
 uint32_t lastSampleMs = 0, lastTftMs = 0, lastWsMs = 0;
 
 // ---- Kendali beban / mode ----
-String  g_mode        = "manual";   // "sim" | "manual" | "cognitive"
+enum { MODE_MANUAL = 0, MODE_SIM = 1, MODE_COGNITIVE = 2 };
+volatile uint8_t g_mode = MODE_MANUAL;     // aman diakses antar-task (bukan String)
+inline const char* modeName(uint8_t m) {
+  return (m == MODE_SIM) ? "sim" : (m == MODE_COGNITIVE) ? "cognitive" : "manual";
+}
 int     targetLevel   = 1;          // level yang dituju
 float   g_grade       = 0;          // dari aplikasi (mode sim)
 
 // ---- Heart rate (dibagi dengan task core-1) ----
 volatile float g_heartRate = 0;
+volatile float g_spo2      = 0;   // SpO2 % (ditulis hrTask, dibaca loop)
 
 String faultMsg = "";
 
@@ -221,6 +239,7 @@ h1{font-size:17px;font-weight:600;text-align:center;margin-bottom:2px}
 <div class="grid">
   <div class="card"><div class="label">Cadence</div><div class="value" id="cadence">0</div><div class="unit">RPM</div></div>
   <div class="card"><div class="label">Detak Jantung</div><div class="value" id="hr">--</div><div class="unit">BPM</div></div>
+  <div class="card"><div class="label">Oksigen (SpO2)</div><div class="value" id="spo2">--</div><div class="unit">% &middot; est</div></div>
   <div class="card"><div class="label">Power</div><div class="value" id="power">0</div><div class="unit">Watt &middot; est</div></div>
   <div class="card"><div class="label">Speed</div><div class="value" id="speed">0</div><div class="unit">km/j &middot; virtual</div></div>
   <div class="card"><div class="label">Torsi</div><div class="value" id="torque">0</div><div class="unit">Nm &middot; est</div></div>
@@ -253,6 +272,7 @@ h1{font-size:17px;font-weight:600;text-align:center;margin-bottom:2px}
 function updateUI(d){
   document.getElementById('cadence').textContent=d.cadence.toFixed(1);
   document.getElementById('hr').textContent=(d.heartRate>0?d.heartRate.toFixed(0):'--');
+  document.getElementById('spo2').textContent=(d.spo2>0?d.spo2.toFixed(0):'--');
   document.getElementById('power').textContent=d.power.toFixed(0);
   document.getElementById('speed').textContent=d.speed.toFixed(1);
   document.getElementById('torque').textContent=d.torque.toFixed(1);
@@ -316,9 +336,12 @@ void saveSession(const SessionSummary &s);
 void resetSession();
 String buildJson();
 void applyControl(const String &mode, bool hasGrade, float grade, bool hasLevel, int level);
+#if USE_TFT
 void tftDrawState();
 void tftDrawMetrics();
 void tftBanner(const String &l1, const String &l2, uint16_t bg);
+#endif
+void stepperTask(void *param);
 void setupWiFi();
 void setupWebServer();
 void hrTask(void *param);
@@ -342,17 +365,28 @@ void setup() {
   #endif
   encoder.clearCount();
 
-  // I2C + MAX30100
+  // I2C + MAX30102 (SparkFun MAX3010x)
+  // Pakai 100 kHz (I2C_SPEED_STANDARD) — lebih andal untuk modul clone MAX30102.
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  hr_ok = pox.begin();
-  if (hr_ok) { pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA); Serial.println("[MAX30100] OK"); }
-  else       Serial.println("[MAX30100] GAGAL — cek wiring/pull-up I2C");
+  hr_ok = particleSensor.begin(Wire, I2C_SPEED_STANDARD);
+  Serial.println(hr_ok ? "[MAX30102] begin() OK" : "[MAX30102] begin() GAGAL (part-ID clone beda) — tetap dikonfigurasi");
+  // Konfigurasi sensor SELALU dijalankan, walau begin() gagal. Pada modul clone,
+  // begin() bisa mengembalikan false karena part-ID beda, padahal chip normal.
+  // brightness 0x1F, 4 sampel avg, mode 2 (Red+IR), 100 sps, lebar 411us, ADC 4096
+  // 100 sps = syarat algoritma Maxim SpO2 (buffer 100 sampel = ~1 detik jendela)
+  particleSensor.setup(0x1F, 4, 2, 100, 411, 4096);
+  // Untuk SpO2, amplitudo RED & IR harus seimbang (algoritma pakai rasio keduanya)
+  particleSensor.setPulseAmplitudeRed(0x24);
+  particleSensor.setPulseAmplitudeIR(0x24);
+  particleSensor.setPulseAmplitudeGreen(0);
+  hr_ok = true;   // sensor sudah dikonfigurasi; hrTask boleh membaca
 
   // Stepper (driver STEP/DIR)
   pinMode(EN_PIN, OUTPUT);
   digitalWrite(EN_PIN, LOW);          // aktifkan driver (aktif LOW)
   stepper.setMaxSpeed(STEPPER_MAX_SPEED);
   stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setMinPulseWidth(5);        // pulsa STEP >=5us agar DM542 andal membaca
 #if USE_HOMING
   homeStepper();                      // cari titik nol via limit switch
 #else
@@ -379,9 +413,11 @@ void setup() {
   } else Serial.println("[LittleFS] GAGAL");
 
   // TFT
+#if USE_TFT
   tft.init();
   tft.setRotation(TFT_ROTATION);
   tft.fillScreen(TFT_BLACK);
+#endif
 
   // WiFi + Web
   setupWiFi();
@@ -390,6 +426,9 @@ void setup() {
   // Task heart rate di core-1
   if (hr_ok)
     xTaskCreatePinnedToCore(hrTask, "hrTask", 4096, NULL, 1, NULL, 1);
+
+  // Task STEPPER di core-0 (terpisah dari loop/TFT/WiFi agar pulsa STEP rata)
+  xTaskCreatePinnedToCore(stepperTask, "stepperTask", 4096, NULL, 3, NULL, 0);
 
   enterState(ST_SELF_CHECK);
 }
@@ -400,10 +439,8 @@ void setup() {
 void loop() {
   uint32_t now = millis();
   met.heartRate = g_heartRate;   // ambil hasil dari task HR
-
-  // Aktuator stepper: set target menurut mode, lalu jalankan (tiap loop)
-  updateActuator();
-  stepper.run();
+  met.spo2      = g_spo2;         // saturasi oksigen dari task HR
+  // Stepper dijalankan di stepperTask (core-0), bukan di sini.
 
   // Sampling sensor (250 ms)
   if (sysState != ST_BOOT && sysState != ST_FAULT) {
@@ -427,12 +464,16 @@ void loop() {
 
   handleStateLogic();
 
+#if USE_TFT
   if (now - lastTftMs >= TFT_REFRESH_MS) {
     lastTftMs = now;
     if (stateChanged) { tftDrawState(); stateChanged = false; }
     if (sysState == ST_RUNNING || sysState == ST_READY || sysState == ST_PAUSED)
       tftDrawMetrics();
   }
+#else
+  stateChanged = false;
+#endif
 
   if (now - lastWsMs >= WS_PUSH_MS) {
     lastWsMs = now;
@@ -481,12 +522,14 @@ void doStopFromRun() {
 void doReset() { if (sysState == ST_SUMMARY || sysState == ST_FAULT) { faultMsg=""; enterState(ST_SELF_CHECK); } }
 void durUp()   { if (sysState == ST_READY && targetDurationMin < MAX_DURATION_MIN) { targetDurationMin++; stateChanged = true; } }
 void durDown() { if (sysState == ST_READY && targetDurationMin > MIN_DURATION_MIN) { targetDurationMin--; stateChanged = true; } }
-void levelUp()   { if (g_mode == "manual" && targetLevel < LEVEL_COUNT) targetLevel++; }
-void levelDown() { if (g_mode == "manual" && targetLevel > 1) targetLevel--; }
+void levelUp()   { if (g_mode == MODE_MANUAL && targetLevel < LEVEL_COUNT) targetLevel++; }
+void levelDown() { if (g_mode == MODE_MANUAL && targetLevel > 1) targetLevel--; }
 
 // Terapkan perintah dari aplikasi / web
 void applyControl(const String &mode, bool hasGrade, float grade, bool hasLevel, int level) {
-  if (mode == "sim" || mode == "manual" || mode == "cognitive") g_mode = mode;
+  if      (mode == "sim")       g_mode = MODE_SIM;
+  else if (mode == "manual")    g_mode = MODE_MANUAL;
+  else if (mode == "cognitive") g_mode = MODE_COGNITIVE;
   if (hasGrade)  g_grade = grade;
   if (hasLevel)  targetLevel = constrain(level, 1, LEVEL_COUNT);
 }
@@ -562,7 +605,7 @@ void homeStepper() {
 }
 void updateActuator() {
   // Tentukan target level menurut mode
-  if (g_mode == "sim") targetLevel = gradeToLevel(g_grade);
+  if (g_mode == MODE_SIM) targetLevel = gradeToLevel(g_grade);
   // "manual": targetLevel dari tombol/app ; "cognitive": (menyusul) pertahankan
 
   long targetPos = positionForLevel(targetLevel);
@@ -634,12 +677,13 @@ void saveSession(const SessionSummary &s) {
 String buildJson() {
   StaticJsonDocument<1280> doc;
   doc["state"]      = stateNames[sysState];
-  doc["mode"]       = g_mode;
+  doc["mode"]       = modeName(g_mode);
   doc["cadence"]    = met.cadenceRpm;
   doc["torque"]     = met.torqueNm;
   doc["power"]      = met.powerW;
   doc["speed"]      = met.speedKmh;
   doc["heartRate"]  = met.heartRate;
+  doc["spo2"]       = met.spo2;
   doc["level"]      = met.level;
   doc["targetLevel"]= targetLevel;
   doc["actuatorPos"] = met.actuatorPos;
@@ -676,8 +720,9 @@ String buildJson() {
 }
 
 // =============================================================================
-// 16. TFT
+// 16. TFT  (hanya dikompilasi bila USE_TFT = 1)
 // =============================================================================
+#if USE_TFT
 void tftBanner(const String &l1, const String &l2, uint16_t bg) {
   tft.fillRect(0, 0, tft.width(), 36, bg);
   tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(1);
@@ -695,7 +740,7 @@ void tftDrawState() {
       tft.setCursor(6,126); tft.print("AKTUATOR"); tft.setCursor(170,46); tft.print("HR");
       tft.setCursor(170,86); tft.print("MODE");
       tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setCursor(170,100); tft.print(g_mode);
+      tft.setCursor(170,100); tft.print(modeName(g_mode));
       break;
     }
     case ST_RUNNING: {
@@ -745,16 +790,71 @@ void tftDrawMetrics() {
     field(170,58,(met.heartRate>0)?String(met.heartRate,0):"--");
   }
 }
+#endif  // USE_TFT
 
 // =============================================================================
-// 17. HEART RATE TASK (core-1)
+// 17. HEART RATE TASK (core-1) — MAX30102 via deteksi denyut
 // =============================================================================
+// Ambil 1 sampel IR+RED dari FIFO (menunggu data baru, tetap yield ke RTOS).
+static inline void readOneSample(uint32_t &red, uint32_t &ir) {
+  while (particleSensor.available() == false) {
+    particleSensor.check();               // tarik data baru dari sensor
+    vTaskDelay(1);                         // beri napas ke task lain (WDT aman)
+  }
+  red = particleSensor.getRed();
+  ir  = particleSensor.getIR();
+  particleSensor.nextSample();
+}
+
 void hrTask(void *param) {
+  const int32_t BUF_LEN = 100;            // 100 sampel @100Hz = jendela ~1 detik
+  static uint32_t irBuf[100];
+  static uint32_t redBuf[100];
+  int32_t  spo2;       int8_t validSpo2;
+  int32_t  heartRate;  int8_t validHR;
+  uint32_t lastDbg = 0;
+
+  // Isi buffer awal 100 sampel
+  for (int i = 0; i < BUF_LEN; i++) readOneSample(redBuf[i], irBuf[i]);
+  maxim_heart_rate_and_oxygen_saturation(irBuf, BUF_LEN, redBuf,
+                                         &spo2, &validSpo2, &heartRate, &validHR);
+
   for (;;) {
-    pox.update();                 // wajib sesering mungkin
-    float hr = pox.getHeartRate();
-    g_heartRate = (hr > 30 && hr < 220) ? hr : 0;
-    vTaskDelay(2 / portTICK_PERIOD_MS);
+    // Geser buffer: buang 25 sampel terlama, majukan sisanya
+    for (int i = 25; i < BUF_LEN; i++) { redBuf[i - 25] = redBuf[i]; irBuf[i - 25] = irBuf[i]; }
+    // Ambil 25 sampel baru (~0,25 detik) -> update ~4x/detik
+    for (int i = 75; i < BUF_LEN; i++) readOneSample(redBuf[i], irBuf[i]);
+
+    maxim_heart_rate_and_oxygen_saturation(irBuf, BUF_LEN, redBuf,
+                                           &spo2, &validSpo2, &heartRate, &validHR);
+
+    long ir = irBuf[BUF_LEN - 1];
+    if (ir < HR_FINGER_IR) {              // tidak ada jari
+      g_heartRate = 0;
+      g_spo2      = 0;
+    } else {
+      if (validHR   && heartRate > 30 && heartRate < 220) g_heartRate = heartRate;
+      if (validSpo2 && spo2 > 50 && spo2 <= 100)          g_spo2      = spo2;
+    }
+
+#if HR_DEBUG
+    if (millis() - lastDbg >= 1000) {
+      lastDbg = millis();
+      Serial.printf("[IR] %ld  BPM=%.0f(%d)  SpO2=%.0f(%d)\n",
+                    ir, g_heartRate, validHR, g_spo2, validSpo2);
+    }
+#endif
+  }
+}
+
+// =============================================================================
+// 17b. STEPPER TASK (core-0) — pulsa STEP tidak diganggu TFT/WiFi
+// =============================================================================
+void stepperTask(void *param) {
+  for (;;) {
+    updateActuator();     // set target menurut mode + baca posisi
+    stepper.run();        // hasilkan pulsa STEP
+    vTaskDelay(1);        // ~1 ms; cukup halus untuk kecepatan leveling
   }
 }
 
@@ -768,8 +868,12 @@ void setupWiFi() {
   IPAddress ip = WiFi.softAPIP();
   if (ok) {
     Serial.printf("[WiFi] AP '%s' -> http://%s\n", AP_SSID, ip.toString().c_str());
+#if USE_TFT
     tftBanner("AP: " + String(AP_SSID), "http://" + ip.toString(), TFT_NAVY);
   } else tftBanner("WiFi GAGAL", "softAP error", TFT_MAROON);
+#else
+  }
+#endif
   delay(800);
 }
 
@@ -783,7 +887,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
       StaticJsonDocument<256> in;
       if (deserializeJson(in, data, len) == DeserializationError::Ok) {
-        String mode = in["mode"] | g_mode;
+        String mode = in["mode"] | modeName(g_mode);
         bool hasGrade = in.containsKey("grade");
         // Field level diseragamkan: terima "level" (utama) atau "targetLevel" (alias)
         bool hasLevel = in.containsKey("level") || in.containsKey("targetLevel");
@@ -804,7 +908,7 @@ void setupWebServer() {
 
   // Kendali beban/mode dari aplikasi (alternatif WebSocket)
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *req){
-    String mode = req->hasParam("mode") ? req->getParam("mode")->value() : g_mode;
+    String mode = req->hasParam("mode") ? req->getParam("mode")->value() : String(modeName(g_mode));
     bool hasGrade = req->hasParam("grade");
     bool hasLevel = req->hasParam("level");
     float grade = hasGrade ? req->getParam("grade")->value().toFloat() : 0;
