@@ -22,7 +22,7 @@ using fs::File;
 // =============================================================================
 
 // ---- WiFi (ESP32 = Access Point, KONTINU) ----
-static const char* AP_SSID     = "FPOKTeraphyBike";
+static const char* AP_SSID     = "BI-CO";
 static const char* AP_PASSWORD = "coe123456";       // min 8 karakter
 static const int   AP_CHANNEL  = 6;
 static const int   AP_MAX_CONN = 4;
@@ -229,8 +229,8 @@ h1{font-size:17px;font-weight:600;text-align:center;margin-bottom:2px}
 .summary .lbl{color:#777}
 .note{text-align:center;font-size:11px;color:#999;margin-top:14px}
 </style></head><body><div class="wrap">
-<h1>Therapy Bike Monitor</h1>
-<div class="sub">Monitoring latihan &mdash; bukan alat diagnosis</div>
+<h1>Therapy Bike Cognitive</h1>
+<div class="sub">Monitoring latihan</div>
 <div class="state" id="stateBar">Menghubungkan...</div>
 <div class="mode">Mode:
   <button id="mSim" onclick="setMode('sim')">SIM</button>
